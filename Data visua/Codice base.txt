@@ -1,0 +1,41 @@
+library(sf)
+library(dplyr)
+library(stringr)
+library(purrr)
+
+# ── Step 1: ricostruisci geometry da testo R (PRIMA del cleaning) ──────────
+water_insecurity_2023 <- water_insecurity_2023 %>%
+  mutate(
+    geometry = purrr::map(geometry, ~ eval(parse(text = .x)))
+  )
+
+# Converti in sf object con CRS originale (EPSG:5070 = Albers USA)
+water_insecurity_2023 <- sf::st_sf(
+  water_insecurity_2023 %>% sf::st_drop_geometry(),   # attributi senza geom
+  geometry = sf::st_sfc(water_insecurity_2023$geometry, crs = 5070)
+) %>%
+  sf::st_make_valid()
+
+# ── Step 2: cleaning + feature engineering (ora funziona su sf object) ─────
+water_clean <- water_insecurity_2023 %>%
+  filter(!is.na(plumbing), !is.na(percent_lacking_plumbing), !is.na(total_pop)) %>%
+  mutate(
+    rate             = percent_lacking_plumbing / 100,
+    check_rate       = plumbing / total_pop,
+    lacking_population = plumbing,
+    state            = str_trim(str_extract(name, "[^,]+$")),
+    log_population   = log10(total_pop)
+  )
+
+# ── Step 3: validation summary ─────────────────────────────────────────────
+validation_summary <- water_clean %>%
+  sf::st_drop_geometry() %>%
+  summarise(
+    n_rows         = n(),
+    max_abs_diff   = max(abs(rate - check_rate), na.rm = TRUE),
+    mean_abs_diff  = mean(abs(rate - check_rate), na.rm = TRUE),
+    n_rate_gt_1    = sum(rate > 1,  na.rm = TRUE),
+    n_rate_lt_0    = sum(rate < 0,  na.rm = TRUE)
+  )
+
+validation_summary

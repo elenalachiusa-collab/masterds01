@@ -1,0 +1,280 @@
+# DATASET DEFINITIVO 
+# ══════════════════════════════════════════════════════════════════
+# INSTALLAZIONE PACKAGES (eseguito solo se non presenti)
+# ══════════════════════════════════════════════════════════════════
+
+pkgs <- c("sf", "dplyr", "stringr", "purrr", "ggplot2",
+          "scales", "readr", "tigris", "forcats", "ggrepel")
+
+install.packages(setdiff(pkgs, rownames(installed.packages())))
+
+library(sf)
+library(dplyr)
+library(stringr)
+library(purrr)
+library(ggplot2)
+library(scales)
+library(readr)
+library(tigris)
+library(forcats)
+library(ggrepel)
+
+options(tigris_use_cache = TRUE)
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 0 — Carica dati raw da GitHub
+# ══════════════════════════════════════════════════════════════════
+
+water_raw <- readr::read_csv(
+  "https://raw.githubusercontent.com/rfordatascience/tidytuesday/main/data/2025/2025-01-28/water_insecurity_2023.csv",
+  show_col_types = FALSE
+) %>%
+  select(-geometry)
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 1 — Geometrie ufficiali Census via tigris
+# ══════════════════════════════════════════════════════════════════
+
+counties_sf <- tigris::counties(cb = TRUE, year = 2023, progress_bar = FALSE) %>%
+  sf::st_transform(crs = 5070) %>%
+  select(geoid = GEOID, geometry)
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 2 — Join geometrie + dati tabulari
+# ══════════════════════════════════════════════════════════════════
+
+water_sf <- counties_sf %>%
+  inner_join(water_raw, by = "geoid")
+
+cat("Righe:", nrow(water_sf), "\n")
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 3 — Cleaning + feature engineering
+# ══════════════════════════════════════════════════════════════════
+
+water_clean <- water_sf %>%
+  filter(!is.na(plumbing), !is.na(percent_lacking_plumbing), !is.na(total_pop)) %>%
+  mutate(
+    rate               = percent_lacking_plumbing / 100,
+    check_rate         = plumbing / total_pop,
+    lacking_population = plumbing,
+    state              = str_trim(str_extract(name, "[^,]+$")),
+    log_population     = log10(total_pop)
+  )
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 4 — Validation summary
+# ══════════════════════════════════════════════════════════════════
+
+validation_summary <- water_clean %>%
+  sf::st_drop_geometry() %>%
+  summarise(
+    n_rows        = n(),
+    max_abs_diff  = max(abs(rate - check_rate), na.rm = TRUE),
+    mean_abs_diff = mean(abs(rate - check_rate), na.rm = TRUE),
+    n_rate_gt_1   = sum(rate > 1,  na.rm = TRUE),
+    n_rate_lt_0   = sum(rate < 0,  na.rm = TRUE)
+  )
+print(validation_summary)
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 5 — Derived tables
+# ══════════════════════════════════════════════════════════════════
+
+top_counties <- water_clean %>%
+  st_drop_geometry() %>%
+  filter(!is.na(rate), total_pop > 0) %>%
+  arrange(desc(rate)) %>%
+  slice_head(n = 10) %>%
+  select(geoid, county = name, state, total_pop, lacking_population, rate) %>%
+  mutate(
+    rate_pct  = scales::percent(rate, accuracy = 0.01),
+    total_pop = scales::comma(total_pop)
+  )
+
+state_weighted <- water_clean %>%
+  st_drop_geometry() %>%
+  filter(!is.na(lacking_population), !is.na(total_pop), total_pop > 0) %>%
+  group_by(state) %>%
+  summarise(
+    n_counties         = n(),
+    total_population   = sum(total_pop,          na.rm = TRUE),
+    total_lacking      = sum(lacking_population, na.rm = TRUE),
+    weighted_rate      = total_lacking / total_population,
+    median_county_rate = median(rate, na.rm = TRUE),
+    max_county_rate    = max(rate,    na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(weighted_rate)) %>%
+  mutate(
+    weighted_rate_pct = scales::percent(weighted_rate,      accuracy = 0.01),
+    median_rate_pct   = scales::percent(median_county_rate, accuracy = 0.01),
+    max_rate_pct      = scales::percent(max_county_rate,    accuracy = 0.01),
+    total_population  = scales::comma(total_population),
+    total_lacking     = scales::comma(total_lacking)
+  )
+
+top_counties   %>% as_tibble() %>% print(n = 10)
+state_weighted %>% as_tibble() %>% print(n = 20)
+
+# ══════════════════════════════════════════════════════════════════
+# PLOT 1 — Top 10 counties by plumbing deprivation rate
+# ══════════════════════════════════════════════════════════════════
+
+p1 <- top_counties %>%
+  mutate(county = fct_reorder(county, rate)) %>%
+  ggplot(aes(x = rate, y = county, fill = rate)) +
+  geom_col(width = 0.7) +
+  geom_text(
+    aes(label = rate_pct),
+    hjust = -0.15, size = 3.5, color = "grey30"
+  ) +
+  scale_fill_viridis_c(option = "magma", direction = -1, guide = "none") +
+  scale_x_continuous(
+    labels = scales::percent_format(accuracy = 0.1),
+    expand = expansion(mult = c(0, 0.15))
+  ) +
+  labs(
+    title    = "Top 10 Counties by Plumbing Deprivation (2023)",
+    subtitle = "Share of population lacking complete plumbing",
+    x        = "Rate",
+    y        = NULL,
+    caption  = "Source: ACS 5-Year Estimates · TidyTuesday 2025-01-28"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title         = element_text(face = "bold", size = 14),
+    plot.subtitle      = element_text(color = "grey40", size = 10),
+    plot.caption       = element_text(color = "grey55", size = 8),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank()
+  )
+
+p1
+ggsave("plot1_top_counties.png", p1, width = 9, height = 6, dpi = 300, bg = "white")
+
+# ══════════════════════════════════════════════════════════════════
+# PLOT 2 — State ranking by population-weighted exposure
+# ══════════════════════════════════════════════════════════════════
+
+p2 <- state_weighted %>%
+  slice_head(n = 20) %>%
+  mutate(state = fct_reorder(state, weighted_rate)) %>%
+  ggplot(aes(x = weighted_rate, y = state, fill = weighted_rate)) +
+  geom_col(width = 0.7) +
+  geom_text(
+    aes(label = weighted_rate_pct),
+    hjust = -0.15, size = 3.2, color = "grey30"
+  ) +
+  scale_fill_viridis_c(option = "magma", direction = -1, guide = "none") +
+  scale_x_continuous(
+    labels = scales::percent_format(accuracy = 0.01),
+    expand = expansion(mult = c(0, 0.18))
+  ) +
+  labs(
+    title    = "Top 20 States by Population-Weighted Plumbing Insecurity (2023)",
+    subtitle = "Weighted rate = total lacking plumbing / total state population",
+    x        = "Weighted rate",
+    y        = NULL,
+    caption  = "Source: ACS 5-Year Estimates · TidyTuesday 2025-01-28"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title         = element_text(face = "bold", size = 14),
+    plot.subtitle      = element_text(color = "grey40", size = 10),
+    plot.caption       = element_text(color = "grey55", size = 8),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank()
+  )
+
+p2
+ggsave("plot2_state_ranking.png", p2, width = 9, height = 7, dpi = 300, bg = "white")
+
+# ══════════════════════════════════════════════════════════════════
+# PLOT 3 — Mappa coropletica county-level
+# ══════════════════════════════════════════════════════════════════
+
+p3 <- ggplot(water_clean) +
+  geom_sf(aes(fill = rate), linewidth = 0.05, color = "white") +
+  scale_fill_viridis_c(
+    option    = "magma",
+    direction = -1,
+    labels    = scales::percent_format(accuracy = 0.1),
+    limits    = c(0, NA),
+    na.value  = "grey80"
+  ) +
+  labs(
+    title    = "County-Level Plumbing Insecurity (2023)",
+    subtitle = "Share of population lacking complete plumbing",
+    fill     = "Lacking\nplumbing",
+    caption  = "Source: ACS 5-Year Estimates · TidyTuesday 2025-01-28"
+  ) +
+  theme_void(base_size = 13) +
+  theme(
+    plot.title        = element_text(face = "bold", size = 15, margin = margin(b = 4)),
+    plot.subtitle     = element_text(color = "grey40", size = 11, margin = margin(b = 8)),
+    plot.caption      = element_text(color = "grey55", size = 8, hjust = 0),
+    legend.position   = c(0.92, 0.25),
+    legend.key.height = unit(1.8, "cm"),
+    legend.key.width  = unit(0.4, "cm"),
+    legend.title      = element_text(size = 9, face = "bold"),
+    legend.text       = element_text(size = 8),
+    plot.margin       = margin(10, 10, 10, 10)
+  ) +
+  guides(fill = guide_colorbar(ticks.colour = NA, frame.colour = "grey60"))
+
+p3
+ggsave("plot3_map.png", p3, width = 10, height = 6, dpi = 300, bg = "white")
+
+# ══════════════════════════════════════════════════════════════════
+# PLOT 4 — Scatter: log10(total_pop) vs rate
+# ══════════════════════════════════════════════════════════════════
+
+top_outliers <- water_clean %>%
+  st_drop_geometry() %>%
+  arrange(desc(rate)) %>%
+  slice_head(n = 6)
+
+p4 <- water_clean %>%
+  st_drop_geometry() %>%
+  ggplot(aes(x = log_population, y = rate)) +
+  geom_point(aes(size = lacking_population, color = rate), alpha = 0.5) +
+  geom_label_repel(
+    data         = top_outliers,
+    aes(label    = name),
+    size         = 2.8,
+    color        = "grey20",
+    fill         = "white",
+    label.size   = 0.2,
+    max.overlaps = 10
+  ) +
+  geom_smooth(method = "lm", se = TRUE, color = "grey30", linewidth = 0.8) +
+  scale_color_viridis_c(option = "magma", direction = -1, guide = "none") +
+  scale_size_continuous(
+    name   = "People lacking\nplumbing",
+    labels = scales::comma,
+    range  = c(0.5, 8)
+  ) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  scale_x_continuous(
+    breaks = 3:7,
+    labels = c("1K", "10K", "100K", "1M", "10M")
+  ) +
+  labs(
+    title    = "Plumbing Insecurity vs. County Population Size (2023)",
+    subtitle = "Larger counties tend to have lower deprivation rates",
+    x        = "County population (log scale)",
+    y        = "Rate lacking plumbing",
+    caption  = "Source: ACS 5-Year Estimates · TidyTuesday 2025-01-28"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 14),
+    plot.subtitle    = element_text(color = "grey40", size = 10),
+    plot.caption     = element_text(color = "grey55", size = 8),
+    legend.position  = "right",
+    panel.grid.minor = element_blank()
+  )
+
+p4
+ggsave("plot4_scatter.png", p4, width = 10, height = 7, dpi = 300, bg = "white")
